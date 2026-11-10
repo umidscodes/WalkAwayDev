@@ -1,0 +1,5 @@
+providers:
+  lm-studio:
+    baseUrl: "http://@GATEWAY@"
+    apiKey: "@GATEWAY_TOKEN@"
+    transport: pi-native

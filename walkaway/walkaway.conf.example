@@ -1,0 +1,33 @@
+# walkaway.conf: the one file you fill in before walkaway/init.
+# walkaway/init copies this example to ~/.config/walkaway/walkaway.conf
+# (mode 600) on its first run. Fill in each value there, never in the repo:
+# the ping address is a secret.
+#
+# Format: key=value, one per line, no quotes. Lines starting with # are skipped.
+
+# The model server on the ASUS Ascent GX10, as <ip>:<port>. Use the address the
+# MacBook reaches it on (its Tailscale or LAN IPv4) and the port of its
+# OpenAI-compatible API. The gateway calls http://<engine>/v1.
+engine=<gx10-ip>:<port>
+
+# The model id exactly as the engine lists it: curl http://<engine>/v1/models
+# omp uses it as the default model (lm-studio/<engine_model>).
+engine_model=<model-id-from-v1-models>
+
+# The nightly backup target on the Ryzen PC: a restic repo over sftp.
+# The MacBook must reach it with your ssh key and no password:
+#   ssh-copy-id <user>@<ryzen-host>
+backup_repo=sftp:<user>@<ryzen-host>:<path-to-restic-repo>
+
+# How the backup wakes the PC and puts it back to sleep. Each is one command,
+# split on spaces (no quotes). Wake-on-LAN needs the MacBook on the same LAN as
+# the PC: brew install wakeonlan
+backup_wake=wakeonlan <ryzen-mac-address>
+# Linux on the PC (needs a NOPASSWD sudo rule for systemctl suspend):
+backup_sleep=ssh <user>@<ryzen-host> sudo systemctl suspend
+# Windows on the PC (OpenSSH server on):
+#backup_sleep=ssh <user>@<ryzen-host> rundll32.exe powrprof.dll,SetSuspendState 0,1,0
+
+# The Healthchecks.io ping address of a check with a 5 minute period.
+# It alerts you when the watch on the mac reports a failure or goes silent.
+ping=https://hc-ping.com/<uuid>

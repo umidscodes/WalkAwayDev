@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# walkaway/init: the one command that sets up this mac, first time and after.
+# It reads ~/.config/walkaway/walkaway.conf, writes the hand-written files that
+# host/bin/ug-setup needs, then runs the gh-broker app wizard (first time) or
+# host/bin/ug-setup (later). It never overwrites a file you already have.
+set -Eeuo pipefail
+
+usage() {
+  printf 'usage: walkaway/init [--conf <file>]\n' >&2
+  exit 64
+}
+
+conf="$HOME/.config/walkaway/walkaway.conf"
+case $# in
+  0) ;;
+  2) [[ $1 == --conf ]] || usage; conf=$2 ;;
+  *) usage ;;
+esac
+
+src=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=host/lib/ug.bash disable=SC1091
+source "$src/host/lib/ug.bash"
+tool=walkaway
+die() { ug_die "$tool" "$@"; }
+
+[[ $(uname -s) == Darwin && $(uname -m) == arm64 ]] || die "run this on the Apple silicon mac that runs omp; this is $(uname -s) $(uname -m)"
+[[ $EUID -ne 0 ]] || die "run this as yourself, not with sudo; setup asks for your password when it needs root"
+
+conf_dir=$(dirname "$conf")
+if [[ ! -f $conf ]]; then
+  install -d -m 700 "$conf_dir"
+  cp "$src/walkaway/walkaway.conf.example" "$conf"
+  chmod 600 "$conf"
+  ug_say changed config "wrote $conf from the example"
+  printf 'Fill in each value in %s, then run walkaway/init again.\n' "$conf"
+  exit 1
+fi
+
+# 1. Read and check the config.
+engine="" engine_model="" backup_repo="" backup_wake="" backup_sleep="" ping=""
+while IFS= read -r line || [[ -n $line ]]; do
+  [[ -z ${line//[[:space:]]/} || $line == \#* ]] && continue
+  [[ $line == *=* ]] || die "$conf: a line without '=': $line"
+  key=${line%%=*}
+  value=${line#*=}
+  [[ $value != *'<'* ]] || die "$conf: $key still holds a placeholder: $value"
+  case $key in
+    engine) engine=$value ;;
+    engine_model) engine_model=$value ;;
+    backup_repo) backup_repo=$value ;;
+    backup_wake) backup_wake=$value ;;
+    backup_sleep) backup_sleep=$value ;;
+    ping) ping=$value ;;
+    *) die "$conf: unknown key $key" ;;
+  esac
+done <"$conf"
+
+ip_port='^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$'
+[[ $engine =~ $ip_port ]] || die "$conf: engine must be <ip>:<port>, not '$engine'"
+[[ $engine_model =~ ^[A-Za-z0-9._:/-]+$ ]] || die "$conf: engine_model must be the model id from http://$engine/v1/models, not '$engine_model'"
+if [[ -n $backup_repo ]]; then
+  [[ -n $backup_wake && -n $backup_sleep ]] || die "$conf: backup_repo needs backup_wake and backup_sleep"
+fi
+[[ -z $ping || $ping =~ ^https://[^[:space:]]+$ ]] || die "$conf: ping must be one https:// address"
+
+# 2. The tools that setup needs: gh with your login, jq, and Tailscale.
+missing=()
+for name in gh jq; do
+  command -v "$name" >/dev/null 2>&1 || missing+=("$name")
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  command -v brew >/dev/null 2>&1 || die "install Homebrew from https://brew.sh, then run this again; it installs ${missing[*]}"
+  ug_say changed tools "installing ${missing[*]} with brew"
+  brew install "${missing[@]}"
+fi
+if ! gh auth status >/dev/null 2>&1; then
+  ug_say ok github "gh has no login; logging in"
+  gh auth login
+fi
+ug_say same tools "gh and jq in place"
+
+tailscale=""
+if command -v tailscale >/dev/null 2>&1; then
+  tailscale=tailscale
+elif [[ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
+  tailscale=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+else
+  die "install Tailscale and log in (https://tailscale.com/download/mac), then run this again"
+fi
+ts_ip=$("$tailscale" ip -4 2>/dev/null | head -n 1) || ts_ip=""
+[[ $ts_ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "tailscale gave no IPv4 address; start Tailscale and log in, then run this again"
+ug_say same tailscale "this mac is $ts_ip"
+
+# 3. GitHub: CODEOWNERS must name you, and main needs the ruleset that setup checks.
+slug=$(ug_repo_slug "$src") || die "the origin of $src is not a GitHub repo"
+login=$(gh api user --jq .login) || die "cannot read your GitHub login with gh"
+owners=$(sed -n 's/^\*[[:space:]]*//p' "$src/.github/CODEOWNERS" 2>/dev/null) || owners=""
+[[ $owners == "@$login" ]] || die ".github/CODEOWNERS gives * to '$owners', but gh is logged in as @$login; change it to '* @$login' in a PR, merge it, then run this again"
+
+if ! ug_check_main_rule "$src" "$tool" >/dev/null 2>&1; then
+  read -r -d '' ruleset <<'EOF' || true
+{
+  "name": "main needs the owner",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+  "bypass_actors": [ { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request" } ],
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "pull_request", "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "required_review_thread_resolution": false } },
+    { "type": "required_status_checks", "parameters": {
+        "strict_required_status_checks_policy": false,
+        "required_status_checks": [
+          { "context": "checks", "integration_id": 15368 },
+          { "context": "tests", "integration_id": 15368 } ] } }
+  ]
+}
+EOF
+  printf '%s\n' "main of $slug lacks the ruleset that setup requires. walkaway/init can add this one:"
+  printf '%s\n' "$ruleset"
+  printf 'It needs your approval for every merge to main, and the CI jobs checks and tests.\n'
+  printf 'As a repo admin you can still merge your own PRs (bypass on pull requests only).\n'
+  read -r -p "Add it to $slug now? [y/N] " answer || answer=""
+  [[ $answer == [yY]* ]] || die "no ruleset on main of $slug, so setup would stop; nothing else changed"
+  printf '%s' "$ruleset" | gh api -X POST "repos/$slug/rulesets" --input - >/dev/null || die "GitHub refused the ruleset on $slug"
+  ug_check_main_rule "$src" "$tool" || die "the ruleset was added, but setup's check still fails; see the lines above"
+fi
+ug_say same "main rule" "$slug needs your approval for every merge"
+
+# 4. The hand-written files in the data folder (docs/HOST-STATE.md, "Files that you write by hand").
+data="$HOME/$(ug_fact owner_data)"
+install -d -m 700 "$data"
+
+write_once() {
+  local path=$1 content=$2 tmp
+  if [[ -e $path || -L $path ]]; then
+    ug_say same "${path#"$HOME"/}" "in place; to change it, edit it by hand"
+    return 0
+  fi
+  tmp=$(mktemp "$path.XXXXXX")
+  printf '%s\n' "$content" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$path"
+  ug_say changed "${path#"$HOME"/}" "written"
+}
+
+write_once "$data/addresses" "gateway=$ts_ip:$(ug_fact gateway_port)
+engine=$engine"
+have_engine=$(sed -n 's/^engine=//p' "$data/addresses")
+have_gateway=$(sed -n 's/^gateway=//p' "$data/addresses")
+[[ $have_engine == "$engine" ]] || printf 'warning: %s says engine=%s, but %s says %s; setup uses the addresses file\n' "$data/addresses" "$have_engine" "$conf" "$engine" >&2
+[[ ${have_gateway%:*} == "$ts_ip" ]] || printf 'warning: %s says gateway=%s, but this mac is %s on Tailscale; fix the file, then run this again\n' "$data/addresses" "$have_gateway" "$ts_ip" >&2
+
+cfg="$conf_dir/agent-config"
+if [[ -e $cfg ]]; then
+  ug_say same "agent config" "$cfg in place; edit it and commit to change the agent's config"
+else
+  mkdir -p "$cfg"
+  cp "$src/walkaway/agent-config/models.yml.template" "$cfg/models.yml"
+  sed "s|@ENGINE_MODEL@|$engine_model|g" "$src/walkaway/agent-config/config.yml.template" >"$cfg/config.yml"
+  git -C "$cfg" init -q
+  git -C "$cfg" add -A
+  git -C "$cfg" -c user.name=walkaway -c user.email=walkaway@localhost commit -q -m "agent config from walkaway/init"
+  ug_say changed "agent config" "made the config repo $cfg"
+fi
+write_once "$data/config-repo" "$cfg"
+
+if [[ -n $backup_repo ]]; then
+  install -d -m 700 "$data/backup"
+  write_once "$data/backup/config" "repo=$backup_repo
+wake=$backup_wake
+sleep=$backup_sleep"
+  (
+    # shellcheck source=host/lib/backup-target.bash disable=SC1091
+    source "$src/host/lib/backup-target.bash"
+    backup_target_read "$data/backup/config" || exit 1
+    # shellcheck disable=SC2154
+    if backup_target_up; then
+      ug_say same backup "$target answers ssh"
+    else
+      printf 'warning: %s does not answer ssh now; if it is asleep that is fine, else run: ssh-copy-id %s\n' "$target" "$target" >&2
+    fi
+  ) || die "$data/backup/config is not a valid backup config"
+else
+  printf 'warning: no backup_repo in %s, so nothing backs up the agent home\n' "$conf" >&2
+fi
+
+if [[ -n $ping ]]; then
+  install -d -m 700 "$data/watch"
+  write_once "$data/watch/ping" "$ping"
+fi
+
+# 5. Can this mac reach the engine? Only a hint: the gateway calls it, not this script.
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$engine/v1/models") || code=000
+case $code in
+  200) ug_say same engine "http://$engine/v1/models answers" ;;
+  401 | 403) ug_say same engine "http://$engine/v1/models wants an API key; store it with ug-auth key LM_STUDIO_API_KEY after setup" ;;
+  *) printf 'warning: http://%s/v1/models gave %s; check that the GX10 serves and this mac can reach it\n' "$engine" "$code" >&2 ;;
+esac
+
+# 6. Setup. The wizard registers the gh-broker app once and then runs setup itself.
+if [[ -e $data/github-app.pem || -d $(ug_fact root)/code ]]; then
+  "$src/host/bin/ug-setup"
+else
+  "$src/scripts/gh-broker-app-wizard.sh"
+fi
+
+# 7. What is left, once.
+printf '\nLeft to do, once:\n'
+printf '  ug-auth key LM_STUDIO_API_KEY    (the GX10 key; if it takes none, paste any word: the gateway serves only providers it holds a key for)\n'
+case $(command -v omp 2>/dev/null || true) in
+  "$HOME/.local/bin/omp") ;;
+  *)
+    # shellcheck disable=SC2016
+    printf '  echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >>~/.zprofile    (then open a new terminal)\n'
+    ;;
+esac
+printf 'Then start the agent in any terminal with: omp\n'
