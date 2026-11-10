@@ -64,10 +64,18 @@ fi
 [[ -z $ping || $ping =~ ^https://[^[:space:]]+$ ]] || die "$conf: ping must be one https:// address"
 
 # 2. The tools that setup needs: gh with your login, jq, and Tailscale.
+#    The backup's wake and sleep commands must be on PATH too; brew installs wakeonlan.
 missing=()
 for name in gh jq; do
   command -v "$name" >/dev/null 2>&1 || missing+=("$name")
 done
+if [[ -n $backup_repo ]]; then
+  for name in "${backup_wake%% *}" "${backup_sleep%% *}"; do
+    command -v "$name" >/dev/null 2>&1 && continue
+    [[ $name == wakeonlan ]] || die "$conf: the backup command $name is not on PATH"
+    missing+=(wakeonlan)
+  done
+fi
 if [[ ${#missing[@]} -gt 0 ]]; then
   command -v brew >/dev/null 2>&1 || die "install Homebrew from https://brew.sh, then run this again; it installs ${missing[*]}"
   ug_say changed tools "installing ${missing[*]} with brew"
@@ -77,7 +85,7 @@ if ! gh auth status >/dev/null 2>&1; then
   ug_say ok github "gh has no login; logging in"
   gh auth login
 fi
-ug_say same tools "gh and jq in place"
+ug_say same tools "gh, jq, and the backup commands in place"
 
 tailscale=""
 if command -v tailscale >/dev/null 2>&1; then
@@ -184,7 +192,7 @@ sleep=$backup_sleep"
     if backup_target_up; then
       ug_say same backup "$target answers ssh"
     else
-      printf 'warning: %s does not answer ssh now; if it is asleep that is fine, else run: ssh-copy-id %s\n' "$target" "$target" >&2
+      printf 'warning: %s does not answer ssh with your key now; if it is asleep that is fine, else see walkaway/PLAN.md, "Backup target on Windows"\n' "$target" >&2
     fi
   ) || die "$data/backup/config is not a valid backup config"
 else

@@ -1,32 +1,34 @@
 # walkaway.conf: the one file you fill in before walkaway/init.
 # walkaway/init copies this example to ~/.config/walkaway/walkaway.conf
 # (mode 600) on its first run. Fill in each value there, never in the repo:
-# the ping address is a secret.
+# the ping address is a secret, and the addresses are yours.
 #
 # Format: key=value, one per line, no quotes. Lines starting with # are skipped.
 
-# The model server on the ASUS Ascent GX10, as <ip>:<port>. Use the address the
-# MacBook reaches it on (its Tailscale or LAN IPv4) and the port of its
-# OpenAI-compatible API. The gateway calls http://<engine>/v1.
-engine=<gx10-ip>:<port>
+# The model server on the ASUS Ascent GX10, as <ip>:<port>: its Tailscale IPv4
+# and the port of its OpenAI-compatible API. The gateway calls http://<engine>/v1.
+# Its API key never goes here: after setup, store it with
+#   ug-auth key LM_STUDIO_API_KEY
+engine=<gx10-tailscale-ip>:<port>
 
-# The model id exactly as the engine lists it: curl http://<engine>/v1/models
+# The model id exactly as the engine lists it:
+#   curl -H "Authorization: Bearer <key>" http://<engine>/v1/models
 # omp uses it as the default model (lm-studio/<engine_model>).
 engine_model=<model-id-from-v1-models>
 
-# The nightly backup target on the Ryzen PC: a restic repo over sftp.
-# The MacBook must reach it with your ssh key and no password:
-#   ssh-copy-id <user>@<ryzen-host>
-backup_repo=sftp:<user>@<ryzen-host>:<path-to-restic-repo>
+# The nightly backup target on the Ryzen PC (Windows 11): a restic repo over
+# sftp, in the home of a backup user on the PC. A path with no leading / is
+# inside that user's home. Setup steps: walkaway/PLAN.md, "Backup target on Windows".
+backup_repo=sftp:<backup-user>@<ryzen-lan-ip>:walkaway-restic
 
 # How the backup wakes the PC and puts it back to sleep. Each is one command,
-# split on spaces (no quotes). Wake-on-LAN needs the MacBook on the same LAN as
-# the PC: brew install wakeonlan
+# split on spaces (no quotes). walkaway/init installs wakeonlan with brew.
+# Wake-on-LAN needs the MacBook on the same LAN as the PC.
 backup_wake=wakeonlan <ryzen-mac-address>
-# Linux on the PC (needs a NOPASSWD sudo rule for systemctl suspend):
-backup_sleep=ssh <user>@<ryzen-host> sudo systemctl suspend
-# Windows on the PC (OpenSSH server on):
-#backup_sleep=ssh <user>@<ryzen-host> rundll32.exe powrprof.dll,SetSuspendState 0,1,0
+# Windows: sleeps the PC, or hibernates it while hibernation is on (powercfg /hibernate off).
+backup_sleep=ssh <backup-user>@<ryzen-lan-ip> rundll32.exe powrprof.dll,SetSuspendState 0,1,0
+# Linux on the PC instead (needs a NOPASSWD sudo rule for systemctl suspend):
+#backup_sleep=ssh <user>@<ryzen-host> sudo systemctl suspend
 
 # The Healthchecks.io ping address of a check with a 5 minute period.
 # It alerts you when the watch on the mac reports a failure or goes silent.
