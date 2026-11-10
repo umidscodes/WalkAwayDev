@@ -1,0 +1,102 @@
+#!/bin/bash
+set -eo pipefail
+
+TMPDIR=$(getconf DARWIN_USER_TEMP_DIR)
+export HOME=@AGENT_HOME@ TMPDIR PATH=@ROOT@/code/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export OMP_AUTH_BROKER_URL=http://127.0.0.1:@USAGE_BROKER_PORT@ OMP_AUTH_BROKER_TOKEN=usage-only
+
+root=@ROOT@
+code=$root/code
+agent=$HOME/.omp/agent
+
+die() {
+  printf 'agent-start: %s\n' "$*" >&2
+  exit 1
+}
+
+omp_bin=$(readlink "$code/bin/omp") || die "no $code/bin/omp; the owner runs host/bin/ug-setup"
+want=$(<"$omp_bin.sha256") || die "no $omp_bin.sha256; the owner runs host/bin/ug-setup"
+(
+  have=$(/usr/bin/openssl dgst -sha256 -r "$omp_bin") || die "cannot hash $omp_bin"
+  [[ ${have%% *} == "$want" ]] || die "$omp_bin does not match its pinned SHA-256, so no session starts; the owner runs host/bin/ug-setup"
+) &
+hash_pid=$!
+
+# The agent's ssh login has no desktop session, so macOS logs a failed text-checking service lookup to stderr many times a session.
+# A pipe, not >(...): the pin denies writes to /dev/fd. grep ignores SIGINT so that a Ctrl-C cannot close omp's stderr.
+start_omp() {
+  { "$omp_bin" "$@" 2>&1 1>&3 3>&- | { trap '' INT; /usr/bin/grep --line-buffered -v -F 'dataFromCheckingString received error' >&2 || true; }; } 3>&1
+  exit 0
+}
+
+for dir in "$HOME/.omp" "$agent"; do
+  if [[ -L $dir || ( -e $dir && ! -d $dir ) ]]; then rm -f "$dir"; fi
+  mkdir -p "$dir"
+done
+
+(
+  names=()
+  staged=()
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    names+=("$name")
+    if [[ -e $root/config/$name ]]; then staged+=("$name"); fi
+  done <"$code/config-names"
+  rm -rf -- "${names[@]/#/$agent/}"
+  if (( ${#staged[@]} > 0 )); then cp -cR -- "${staged[@]/#/$root/config/}" "$agent/"; fi
+) &
+copy_pid=$!
+
+copied() {
+  wait "$copy_pid" || die "the config copy failed, so no session starts"
+}
+
+if [[ -z ${UG_REPO:-} ]]; then
+  mkdir -p "$HOME/scratch"
+  cd "$HOME/scratch"
+  wait "$hash_pid" || exit 1
+  copied
+  start_omp "$@"
+fi
+[[ $UG_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "UG_REPO has a value that is not owner/name"
+
+clone=$HOME/work/$UG_REPO
+if [[ ! -d $clone/.git ]]; then
+  rm -rf "$clone"
+  mkdir -p "$clone"
+  git -C "$clone" init -q
+  git -C "$clone" remote add origin "https://github.com/$UG_REPO.git"
+fi
+cd "$clone"
+touch .git/ug-launched
+
+busy() {
+  git rev-parse -q --verify HEAD >/dev/null || die "the clone is busy with its first sync; start the session again in a moment"
+  printf 'agent-start: the background refresh holds the clone of %s; this session starts from the main that the clone has\n' "$UG_REPO" >&2
+  copied
+  start_omp "$@"
+}
+
+sync_status=0
+synced=$(/usr/bin/lockf -k -t 3 .git/ug-sync.lock "$code/bin/gh-broker" sync "$UG_REPO" --cached) || sync_status=$?
+wait "$hash_pid" || exit 1
+(( sync_status != 75 )) || busy "$@"
+(( sync_status == 0 )) || {
+  case $sync_status in
+    69) hint="the gh-broker does not answer; the owner checks it with: sudo launchctl print system/com.underground.gh-broker" ;;
+    2) hint="the gh-broker refused it, for the reason above" ;;
+    *) hint="is the gh-broker app installed on it?" ;;
+  esac
+  printf 'agent-start: gh-broker sync %s failed: %s\n' "$UG_REPO" "$hint" >&2
+  exit 69
+}
+base=$(printf '%s\n' "$synced" | sed -n 's|^origin/\([^ ]*\) is now .*|\1|p')
+[[ -n $base ]] || die "gh-broker sync gave no branch: $synced"
+
+checkout_status=0
+/usr/bin/lockf -k -t 3 .git/ug-sync.lock git checkout -q --detach "origin/$base" || checkout_status=$?
+(( checkout_status != 75 )) || busy "$@"
+(( checkout_status == 0 )) || exit "$checkout_status"
+"$code/bin/gh-broker" sweep "$base" >.git/ug-sweep.log 2>&1 &
+copied
+start_omp "$@"

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.underground.auth-broker</string>
+  <key>UserName</key>
+  <string>@AUTH_USER@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@OMP@</string>
+    <string>auth-broker</string>
+    <string>serve</string>
+    <string>--bind=127.0.0.1:@AUTH_BROKER_PORT@</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@AUTH_HOME@</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>@ROOT@/logs/auth-broker.log</string>
+  <key>StandardErrorPath</key>
+  <string>@ROOT@/logs/auth-broker.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>@AUTH_HOME@</string>
+    <key>PATH</key>
+    <string>/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

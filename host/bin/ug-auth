@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'usage: ug-auth login [<provider>]\n       ug-auth key <NAME>_API_KEY\n       ug-auth list\n       ug-auth revoke <id>\n       ug-auth auth-broker|auth-gateway <args>\n' >&2
+  exit 64
+}
+
+case ${1:-} in
+  auth-broker | auth-gateway) ;;
+  login) [[ $# -le 2 && ${2:-a} =~ ^[a-z0-9][a-z0-9._-]*$ ]] || usage; set -- auth-broker "$@" ;;
+  key) [[ $# -eq 2 && $2 =~ ^[A-Z][A-Z0-9_]*_API_KEY$ ]] || usage ;;
+  list) [[ $# -eq 1 ]] || usage ;;
+  revoke) [[ $# -eq 2 && $2 =~ ^[0-9]+$ ]] || usage ;;
+  *) usage ;;
+esac
+
+self=${BASH_SOURCE[0]}
+while [[ -L $self ]]; do
+  link=$(readlink "$self")
+  [[ $link == /* ]] && self=$link || self="$(dirname "$self")/$link"
+done
+src=$(cd "$(dirname "$self")/../.." && pwd -P)
+# shellcheck source=host/lib/ug.bash disable=SC1091
+source "$src/host/lib/ug.bash"
+pin=$(ug_pin "$src/VERSIONS" omp)
+omp="${UG_ROOT:-$(ug_fact root)}/omp/$pin/omp"
+auth_user=$(ug_fact auth_user)
+auth_home=$(ug_fact auth_home)
+broker_url=http://127.0.0.1:$(ug_fact auth_broker_port)
+
+broker=()
+[[ $1 != auth-gateway ]] || broker=(OMP_AUTH_BROKER_URL="$broker_url")
+
+read -r -d '' credentials <<'EOF' || true
+set -eu
+t=$(tr -d '[:space:]' <"$HOME/.omp/auth-broker.token")
+call() { printf 'header = "Authorization: Bearer %s"\n' "$t" | curl -K - -fsS --max-time 10 "$@"; }
+snap=$(call "$OMP_AUTH_BROKER_URL/v1/snapshot") || { echo "ug-auth: the auth broker did not answer at $OMP_AUTH_BROKER_URL" >&2; exit 1; }
+rows=$(printf '%s' "$snap" | jq -r --arg id "${UG_ID-}" '
+  def redact: length as $n | ([4, ($n / 8 | floor)] | min) as $t | (if $n < 48 then ($n / 4 | floor) else ([.[:16] | match("[-_]"; "g").offset] | last // -1) + 5 end) as $h
+    | .[:$h] + "..." + (if $t > 0 then .[-$t:] else "" end);
+  .credentials[] | select($id == "" or (.id | tostring) == $id)
+  | [.id, .provider, .credential.type,
+     (if .credential.type == "api_key" then (.credential.key | redact) else (.credential.email // .identityKey // "-") end)]
+  | @tsv')
+if [ -z "${UG_ID-}" ]; then
+  printf 'id\tprovider\ttype\taccount or key\n'
+  [ -z "$rows" ] || printf '%s\n' "$rows"
+  exit 0
+fi
+[ -n "$rows" ] || { echo "ug-auth: no active credential has id $UG_ID; see: ug-auth list" >&2; exit 1; }
+call -X POST -H 'Content-Type: application/json' -d '{"cause":"logged out by user"}' "$OMP_AUTH_BROKER_URL/v1/credential/$UG_ID/disable" >/dev/null ||
+  { echo "ug-auth: the auth broker did not turn off credential $UG_ID" >&2; exit 1; }
+printf 'turned off in the auth broker:\n%s\n' "$rows"
+echo 'the secret is still valid at the provider; revoke it there to make it useless'
+EOF
+
+cd /
+if [[ $1 == list || $1 == revoke ]]; then
+  exec sudo -u "$auth_user" -H /usr/bin/env -i HOME="$auth_home" PATH=/usr/bin:/bin OMP_AUTH_BROKER_URL="$broker_url" ${2:+"UG_ID=$2"} /bin/sh -c "$credentials"
+fi
+if [[ $1 == key ]]; then
+  exec sudo -u "$auth_user" -H /usr/bin/env -i HOME="$auth_home" PATH=/usr/bin:/bin OMP_AUTH_BROKER_URL="$broker_url" UG_KEY_NAME="$2" \
+    /bin/sh -c 'printf "paste %s, then enter (not shown): " "$UG_KEY_NAME" >&2
+stty -echo 2>/dev/null; IFS= read -r k; stty echo 2>/dev/null; printf "\n" >&2
+[ -n "$k" ] || { echo "ug-auth: no key given, nothing stored" >&2; exit 1; }
+export "$UG_KEY_NAME=$k"; unset k UG_KEY_NAME
+exec "$0" auth-broker migrate --from-local --include-env' "$omp"
+fi
+exec sudo -u "$auth_user" -H /usr/bin/env -i HOME="$auth_home" PATH=/usr/bin:/bin ${broker[@]+"${broker[@]}"} "$omp" "$@"

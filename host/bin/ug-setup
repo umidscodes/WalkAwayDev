@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ $# -ne 0 ]]; then
+  printf 'usage: ug-setup\n' >&2
+  exit 64
+fi
+
+src=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+# shellcheck source=host/lib/ug.bash disable=SC1091
+source "$src/host/lib/ug.bash"
+data="$HOME/$(ug_fact owner_data)"
+real=$(cd "$data" 2>/dev/null && pwd -P) || real=$data
+case $src/ in
+  "$data/"* | "$real/"*)
+    printf 'ug-setup: %s is inside %s, which setup itself writes; run setup from your own checkout\n' "$src" "$data" >&2
+    exit 64
+    ;;
+esac
+green=$(ug_paint 1 green) yellow=$(ug_paint 1 yellow) plain=$(ug_paint 1 off)
+
+bin_dir="$HOME/.local/bin"
+root=$(ug_fact root)
+agents_dir="$HOME/Library/LaunchAgents"
+addresses_file="$data/addresses"
+tailscale_app=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+
+trap 'ug_stopped $? $LINENO "$BASH_COMMAND" ug-setup host/bin/ug-setup' ERR
+
+later=()
+
+if [[ ${UG_SETUP_PULLED:-} != 1 ]]; then
+  ug_pull_main "$src" ug-setup || exit 1
+  UG_SETUP_PULLED=1 exec "$BASH" "$src/host/bin/ug-setup"
+fi
+ug_check_checkout "$src" ug-setup || exit 1
+pin() {
+  local value
+  value=$(ug_pin "$src/VERSIONS" "$1")
+  [[ $value =~ $2 ]] || ug_die ug-setup "bad pin for $1 in VERSIONS"
+  printf '%s\n' "$value"
+}
+
+omp_pin=$(pin omp '^[0-9A-Za-z.+-]+$')
+omp_sha=$(pin omp_sha256 '^[0-9a-f]{64}$')
+omp_release=$(pin omp_release '^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download$')
+restic_pin=$(pin restic '^[0-9A-Za-z.+-]+$')
+restic_sha=$(pin restic_sha256 '^[0-9a-f]{64}$')
+restic_bz2_sha=$(pin restic_bz2_sha256 '^[0-9a-f]{64}$')
+restic_release=$(pin restic_release '^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download$')
+gh_pin=$(pin gh '^[0-9A-Za-z.+-]+$')
+gh_sha=$(pin gh_sha256 '^[0-9a-f]{64}$')
+gh_zip_sha=$(pin gh_zip_sha256 '^[0-9a-f]{64}$')
+gh_release=$(pin gh_release '^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download$')
+
+[[ $(uname -s) == Darwin && $(uname -m) == arm64 ]] || ug_die ug-setup "the omp pin names omp-darwin-arm64; this mac is $(uname -s) $(uname -m)"
+for name in omp ug-auth; do
+  [[ ! -e $bin_dir/$name || -L $bin_dir/$name ]] || ug_die ug-setup "$bin_dir/$name is a file, not setup's link; move it away, then run setup again"
+done
+ug_services_allowed || ug_die ug-setup "host/services breaks the rule that no job with more rights than the agent reads what the agent makes (docs/adr/0025-agent-input-runs-with-least-rights.md); nothing changed"
+
+cleanup=()
+trap '[[ ${#cleanup[@]} -eq 0 ]] || rm -rf "${cleanup[@]}"' EXIT
+
+omp_stage=""
+stage_omp() {
+  local dest="$root/omp/$omp_pin/omp" have url
+  if [[ -f $dest && -f $dest.sha256 && $(<"$dest.sha256") == "$omp_sha" ]]; then
+    ug_say same "omp $omp_pin" "in place in $dest"
+    return 0
+  fi
+  url="$omp_release/v$omp_pin/omp-darwin-arm64"
+  omp_stage=$(mktemp "${TMPDIR:-/tmp}/ug-omp-download.XXXXXX")
+  cleanup+=("$omp_stage")
+  curl -fsSL --proto '=https' --retry 3 -o "$omp_stage" "$url" || ug_die ug-setup "download of $url failed"
+  have=$(ug_sha256 "$omp_stage")
+  [[ $have == "$omp_sha" ]] || ug_die ug-setup "omp $omp_pin from $url has SHA-256 $have, want $omp_sha; nothing changed"
+  ug_say changed "omp $omp_pin" "downloaded and checked; the root step installs it in $dest"
+}
+
+stage_omp
+install -d -m 700 "$data" "$data/restic" "$data/gh"
+[[ -d $bin_dir ]] || install -d -m 755 "$bin_dir"
+
+install_restic() {
+  local dir="$data/restic/$restic_pin" dest tmp bin have url
+  dest="$dir/restic"
+  if [[ -f $dest && ! -L $dest ]] && [[ $(ug_sha256 "$dest") == "$restic_sha" ]]; then
+    ug_say same "restic $restic_pin" "in place"
+    return 0
+  fi
+  url="$restic_release/v$restic_pin/restic_${restic_pin}_darwin_arm64.bz2"
+  tmp=$(mktemp "$data/restic/.download.XXXXXX")
+  bin=$(mktemp "$data/restic/.binary.XXXXXX")
+  cleanup+=("$tmp" "$bin")
+  curl -fsSL --proto '=https' --retry 3 -o "$tmp" "$url" || ug_die ug-setup "download of $url failed"
+  have=$(ug_sha256 "$tmp")
+  [[ $have == "$restic_bz2_sha" ]] || ug_die ug-setup "restic $restic_pin from $url has SHA-256 $have, want $restic_bz2_sha; nothing changed"
+  bunzip2 -c "$tmp" >"$bin" || ug_die ug-setup "bunzip2 of $url failed; nothing changed"
+  have=$(ug_sha256 "$bin")
+  [[ $have == "$restic_sha" ]] || ug_die ug-setup "restic $restic_pin unpacked has SHA-256 $have, want $restic_sha; nothing changed"
+  chmod 555 "$bin"
+  install -d -m 700 "$dir"
+  mv -f "$bin" "$dest"
+  ug_say changed "restic $restic_pin" "installed in $dest"
+}
+
+stage_gh() {
+  local dir="$data/gh/$gh_pin" dest tmp unpacked have url name="gh_${gh_pin}_macOS_arm64" old
+  dest="$dir/gh"
+  if [[ -f $dest && ! -L $dest ]] && [[ $(ug_sha256 "$dest") == "$gh_sha" ]]; then
+    ug_say same "gh $gh_pin" "in place in $dest"
+  else
+    url="$gh_release/v$gh_pin/$name.zip"
+    tmp=$(mktemp "$data/gh/.download.XXXXXX")
+    unpacked=$(mktemp -d "$data/gh/.unpacked.XXXXXX")
+    cleanup+=("$tmp" "$unpacked")
+    curl -fsSL --proto '=https' --retry 3 -o "$tmp" "$url" || ug_die ug-setup "download of $url failed"
+    have=$(ug_sha256 "$tmp")
+    [[ $have == "$gh_zip_sha" ]] || ug_die ug-setup "gh $gh_pin from $url has SHA-256 $have, want $gh_zip_sha; nothing changed"
+    unzip -q "$tmp" "$name/bin/gh" -d "$unpacked" || ug_die ug-setup "unzip of $url failed; nothing changed"
+    have=$(ug_sha256 "$unpacked/$name/bin/gh")
+    [[ $have == "$gh_sha" ]] || ug_die ug-setup "gh $gh_pin unpacked has SHA-256 $have, want $gh_sha; nothing changed"
+    chmod 555 "$unpacked/$name/bin/gh"
+    install -d -m 700 "$dir"
+    mv -f "$unpacked/$name/bin/gh" "$dest"
+    ug_say changed "gh $gh_pin" "downloaded and checked; the root step installs it for the gh-broker"
+  fi
+  for old in "$data"/gh/*; do
+    [[ $old == "$dir" ]] || rm -rf "$old"
+  done
+}
+
+setup_backup() {
+  local backup="$data/backup"
+  install -d -m 700 "$backup"
+  if [[ ! -s $backup/password ]]; then
+    (umask 077 && openssl rand -base64 32 >"$backup/password") || ug_die ug-setup "cannot write $backup/password"
+    ug_say changed backup "made the password $backup/password"
+    later+=("keep a copy of $backup/password in your password manager; without it, the backup cannot be opened after a loss of this mac")
+  fi
+  if [[ ! -f $backup/config ]]; then
+    later+=("write $backup/config in the format that backup_target_read in host/lib/backup-target.bash reads; until then, no backup runs")
+  fi
+}
+
+put() {
+  local from=$1 to=$2 mode=$3 tmp
+  tmp=$(mktemp "$(dirname "$to")/.put.XXXXXX")
+  cleanup+=("$tmp")
+  cat "$from" >"$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$to"
+}
+
+link() {
+  local target=$1 at=$2
+  rm -f "$at"
+  ln -s "$target" "$at"
+}
+
+retire_agents() {
+  local plist label err keep
+  keep=$(ug_services agent | cut -d '|' -f 1)
+  for plist in "$agents_dir"/com.underground.*.plist; do
+    [[ -e $plist || -L $plist ]] || continue
+    label=${plist##*/}
+    label=${label%.plist}
+    grep -qxF "$label" <<<"$keep" && continue
+    err=$(ug_stop_service "gui/$UID/$label") || ug_die ug-setup "$err"
+    rm -f "$plist"
+    ug_say changed "service $label" "booted out and deleted; this version of underground does not run it"
+  done
+}
+
+install_service_code() {
+  local dir="$data/services" f
+  rm -rf "$dir"
+  install -d -m 700 "$dir" "$dir/host/bin" "$dir/host/lib"
+  for f in host/bin/ug-backup host/bin/ug-watch host/bin/ug-auth host/lib/backup-target.bash host/lib/ug.bash host/facts host/services VERSIONS; do
+    put "$src/$f" "$dir/$f" 444
+  done
+  chmod 555 "$dir/host/bin/ug-backup" "$dir/host/bin/ug-watch" "$dir/host/bin/ug-auth"
+  link "$dir/host/bin/ug-auth" "$bin_dir/ug-auth"
+  ug_say ok services "code installed in $dir, ug-auth on PATH as $bin_dir/ug-auth"
+}
+
+write_addresses() {
+  local tailscale out ip engine tmp port
+  port=$(ug_fact gateway_port)
+  local fix="write $addresses_file with the lines gateway=<tailscale address of this mac>:$port and engine=<ip>:<port> of the inference engine"
+  if [[ -e $addresses_file || -L $addresses_file ]]; then
+    ug_say same addresses "$addresses_file in place"
+    return 0
+  fi
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale=tailscale
+  elif [[ -x $tailscale_app ]]; then
+    tailscale=$tailscale_app
+  else
+    ug_die ug-setup "tailscale is not installed; install it, or $fix"
+  fi
+  out=$("$tailscale" ip -4 2>&1) || true
+  ip=${out%%$'\n'*}
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] ||
+    ug_die ug-setup "tailscale ip -4 gave no IPv4 address${out:+ (it printed: ${out//$'\n'/ })}; start tailscale, or $fix"
+  [[ -t 0 ]] || ug_die ug-setup "no $addresses_file, and no terminal to ask for the engine address; $fix"
+  read -r -p "engine address of the inference engine, as <ip>:<port>: " engine || engine=''
+  [[ $engine =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$ ]] || ug_die ug-setup "the engine address '$engine' is not <ip>:<port>; nothing was written. Run setup again, or $fix"
+  tmp=$(mktemp "$addresses_file.XXXXXX")
+  cleanup+=("$tmp")
+  printf 'gateway=%s:%s\nengine=%s\n' "$ip" "$port" "$engine" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$addresses_file"
+  ug_say changed addresses "wrote $addresses_file with gateway=$ip:$port and engine=$engine"
+}
+
+prepare_services() {
+  install -d -m 700 "$data/state" "$data/watch"
+  if [[ ! -s $data/watch/ping ]]; then
+    later+=("write the ping address of an outside check (docs/adr/0023-failures-reach-the-owner.md) into $data/watch/ping; until then, nothing outside this mac tells you when the mac or the watch stops")
+  fi
+  write_addresses
+}
+
+start_services() {
+  local label name scope user template health log tokens agent_input kind target rendered out fp resolved file
+  local -a inputs=() answers=()
+  install -d "$agents_dir"
+  while IFS='|' read -r label name scope user template health log tokens agent_input; do
+    rendered=$(mktemp "$agents_dir/.$label.XXXXXX")
+    cleanup+=("$rendered")
+    out=$(ug_render "$rendered" "$src/$template" "$template" -e "s|@DATA@|$data|g") || ug_die ug-setup "$out"
+    health=$(ug_service_expand "$health") || ug_die ug-setup "cannot expand the health of $label"
+    kind=${health%% *}
+    target=${health#* }
+    case $kind in
+      http) answers=(ug_http_answers "$target") ;;
+      port) answers=(ug_port_answers "${target%:*}" "${target##*:}") ;;
+      launchd) answers=(launchctl print "gui/$UID/$label") ;;
+      none) answers=(true) ;;
+      *) ug_die ug-setup "the service table gives $label the health kind $kind, which an owner service cannot use" ;;
+    esac
+    resolved=$(ug_service_inputs "$tokens") || ug_die ug-setup "cannot expand the inputs of $label"
+    inputs=()
+    while IFS= read -r file; do [[ -n $file ]] && inputs+=("$file"); done <<<"$resolved"
+    fp=$(ug_fingerprint "$rendered" ${inputs[@]+"${inputs[@]}"}) || ug_die ug-setup "cannot read the inputs of $label"
+    out=$(ug_ensure_service "gui/$UID" "$label" "$rendered" "$agents_dir/$label.plist" "$data/state/$label.fingerprint" "$fp" "${answers[@]}") ||
+      ug_die ug-setup "$out; read $(ug_service_expand "$log")"
+    ug_say "$(ug_service_kind "$out")" "service $label" "$out"
+  done < <(ug_services agent)
+}
+
+check_path() {
+  local dirs dir found=()
+  IFS=: read -r -a dirs <<<"$PATH"
+  for dir in "${dirs[@]}"; do
+    [[ -n $dir && -x $dir/omp && ! -d $dir/omp ]] && found+=("$dir/omp")
+  done
+  if [[ ${#found[@]} -eq 0 ]]; then
+    later+=("no omp is on PATH; put $bin_dir on PATH, so that omp starts the agent")
+  elif [[ ${found[0]} != "$bin_dir/omp" ]]; then
+    later+=("the first omp on PATH is ${found[0]}, not the agent launcher $bin_dir/omp; put $bin_dir on PATH before ${found[0]%/omp}")
+  elif [[ ${#found[@]} -gt 1 ]]; then
+    later+=("more than one omp is on PATH: ${found[*]}; remove all but $bin_dir/omp")
+  fi
+}
+
+finish() {
+  if [[ ${#later[@]} -eq 0 ]]; then
+    printf '%sug-setup: done; nothing is left to do%s\n' "$green" "$plain"
+    return 0
+  fi
+  printf '%sug-setup: done.%s %sstill to do:%s\n' "$green" "$plain" "$yellow" "$plain"
+  local item
+  for item in "${later[@]}"; do
+    printf '  %s-%s %s\n' "$yellow" "$plain" "$item"
+  done
+}
+
+check_walls() {
+  local bad=() text me omp_group agent_group auth_home broker_home
+  me=$(id -un)
+  omp_group=$(ug_fact omp_group) agent_group=$(ug_fact agent_group) auth_home=$(ug_fact auth_home) broker_home=$(ug_fact gh_broker_home)
+  [[ ! -x $root/omp/$omp_pin/omp ]] || bad+=("you can run $root/omp/$omp_pin/omp, so you are in the group $omp_group (remove yourself: sudo dseditgroup -o edit -d $me -t user $omp_group)")
+  [[ ! -r $root/config/models.yml ]] || bad+=("you can read the gateway bearer in $root/config/models.yml, so you are in the group $agent_group (remove yourself: sudo dseditgroup -o edit -d $me -t user $agent_group)")
+  ! ls "$auth_home" >/dev/null 2>&1 || bad+=("you can read the login user's home $auth_home (close it: sudo chmod 700 $auth_home)")
+  ! ls "$broker_home" >/dev/null 2>&1 || bad+=("you can read the gh-broker user's home $broker_home (close it: sudo chmod 700 $broker_home)")
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    text=$(printf '%s; ' "${bad[@]}")
+    ug_die ug-setup "a wall is open: ${text%; }. Close it, then run host/bin/ug-setup again"
+  fi
+  ug_say ok walls "you cannot run omp, read the bearer, read the logins, or read the gh-broker's home"
+  if [[ -e $HOME/.omp/profiles/ug-auth ]]; then
+    later+=("$HOME/.omp/profiles/ug-auth still holds old logins; log in again with ug-auth, sign out of the old sessions at each provider, then delete it")
+  fi
+}
+
+install_restic
+stage_gh
+retire_agents
+install_service_code
+setup_backup
+prepare_services
+ug_say ok "agent user" "running sudo host/bin/ug-agent-setup, which asks for your password"
+no_color=()
+[[ -z ${NO_COLOR:-} ]] || no_color=(env NO_COLOR=1)
+sudo ${no_color[@]+"${no_color[@]}"} "$src/host/bin/ug-agent-setup" ${omp_stage:+"$omp_stage"} || ug_die ug-setup "ug-agent-setup failed, so the agent user is not up to date; fix its error and run host/bin/ug-setup again"
+start_services
+check_walls
+check_path
+finish
